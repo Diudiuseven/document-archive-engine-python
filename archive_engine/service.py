@@ -39,10 +39,15 @@ class DocumentArchiveService:
 
     # ---- 文档 ----
     def create_document(
-        self, policy_id: str, content: bytes, document_id: Optional[str] = None
+        self,
+        policy_id: str,
+        content: bytes,
+        document_id: Optional[str] = None,
+        *,
+        created_at: Optional[datetime] = None,
     ) -> Document:
         policy = self.policies.get_policy(policy_id)
-        now = self._now()
+        now = created_at or self._now()
         archive_due, destroy_due = self.policies.compute_schedule(policy, now)
         doc = Document(
             document_id=document_id or uuid.uuid4().hex,

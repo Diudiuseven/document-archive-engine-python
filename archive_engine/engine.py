@@ -281,6 +281,9 @@ class ArchiveEngine:
             status, due_column, now, after_id=after_id, limit=self._batch_size
         )
         if not docs:
+            if after_id:
+                # 游标已扫到末尾，重置以便下一轮从头扫描
+                self._storage.save_checkpoint(task_name, "")
             return result
 
         deadline = time.monotonic() + self._timeout
@@ -302,8 +305,12 @@ class ArchiveEngine:
                             detail=str(exc),
                         )
                     )
-        # 提交检查点：重启后从本批末尾继续
-        self._storage.save_checkpoint(task_name, docs[-1].document_id)
+        # 提交检查点：重启后从本批末尾继续；扫描完成则重置游标，
+        # 避免漏掉游标之前但当时未到期/新加入的文档。
+        if len(docs) < self._batch_size:
+            self._storage.save_checkpoint(task_name, "")
+        else:
+            self._storage.save_checkpoint(task_name, docs[-1].document_id)
         if token is not None and token.cancelled:
             result.cancelled = True
         return result

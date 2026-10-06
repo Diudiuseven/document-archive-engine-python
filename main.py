@@ -63,12 +63,6 @@ def _doc_view(doc) -> dict:
     }
 
 
-@app.exception_handler(DocumentNotFoundError)
-@app.exception_handler(PolicyNotFoundError)
-async def _not_found(request, exc):
-    raise HTTPException(status_code=404, detail=str(exc))
-
-
 @app.post("/policies", status_code=201)
 def create_policy(body: PolicyIn):
     policy = service.policies.create_policy(RetentionPolicy(**body.model_dump()))

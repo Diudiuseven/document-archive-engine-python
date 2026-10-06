@@ -1,12 +1,12 @@
 """保留策略服务：策略变更后对已有文档按新策略重算到期时间。
 
-重算只影响尚未处理完成的文档（active/archived 且未进入销毁终态），
-已归档完成时间与已销毁记录等历史结果不被追溯改写。
+重算只影响尚未处理完成的文档（active/archiving/archived），
+已进入销毁流程或已销毁的文档属于历史结果，不被追溯改写。
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .errors import PolicyNotFoundError
@@ -18,13 +18,17 @@ _NON_RECOMPUTABLE = frozenset(
     {DocumentStatus.PENDING_DESTRUCTION, DocumentStatus.DESTROYED}
 )
 
+#: 重算时分页大小，避免一次性加载全部文档。
+_RECOMPUTE_PAGE = 200
+
 
 class PolicyService:
     def __init__(self, storage: Storage) -> None:
         self._storage = storage
 
     def create_policy(self, policy: RetentionPolicy) -> RetentionPolicy:
-        raise NotImplementedError
+        self._storage.put_policy(policy)
+        return policy
 
     def update_policy(
         self,
@@ -35,7 +39,18 @@ class PolicyService:
         now: Optional[datetime] = None,
     ) -> RetentionPolicy:
         """更新策略并分页重算受影响文档的到期时间。返回新版本策略。"""
-        raise NotImplementedError
+        current = self.get_policy(policy_id)
+        updated = RetentionPolicy(
+            policy_id=policy_id,
+            active_days=active_days if active_days is not None else current.active_days,
+            archived_days=(
+                archived_days if archived_days is not None else current.archived_days
+            ),
+            version=current.version + 1,
+        )
+        self._storage.put_policy(updated)
+        self._recompute_documents(updated, now or datetime.now(timezone.utc))
+        return updated
 
     def get_policy(self, policy_id: str) -> RetentionPolicy:
         policy = self._storage.get_policy(policy_id)
@@ -55,4 +70,23 @@ class PolicyService:
         self, policy: RetentionPolicy, now: datetime
     ) -> int:
         """游标分页重算，返回受影响文档数。"""
-        raise NotImplementedError
+        affected = 0
+        after_id = ""
+        while True:
+            page = self._storage.iter_documents_by_policy(
+                policy.policy_id, after_id=after_id, limit=_RECOMPUTE_PAGE
+            )
+            if not page:
+                break
+            for doc in page:
+                after_id = doc.document_id
+                if doc.status in _NON_RECOMPUTABLE:
+                    continue  # 历史结果不改写
+                archive_due, destroy_due = self.compute_schedule(
+                    policy, doc.created_at
+                )
+                self._storage.update_document_schedule(
+                    doc.document_id, archive_due, destroy_due, policy.version
+                )
+                affected += 1
+        return affected

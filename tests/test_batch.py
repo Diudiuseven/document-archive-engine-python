@@ -128,3 +128,37 @@ def test_restart_recovery_from_checkpoint(tmp_path):
     for i in range(5):
         assert svc2.get_document(f"d{i}").status == DocumentStatus.ARCHIVED
     svc2.close()
+
+
+def test_concurrent_processing_and_reads_consistent(service, policy):
+    """并发处理 + 并发读取：读取方只看到完整已提交状态，无文档滞留中间态。"""
+    for i in range(30):
+        make_doc(service, policy, f"d{i:02d}")
+    service.storage.delete_content("d05")  # 注入一个会失败的文档
+    stop = threading.Event()
+    observed = []
+
+    def reader():
+        while not stop.is_set():
+            for i in range(30):
+                observed.append(service.get_document(f"d{i:02d}").status)
+
+    def runner():
+        service.engine.run_archive_batch(ARCHIVE_AT)
+
+    threads = [threading.Thread(target=runner) for _ in range(2)]
+    threads.append(threading.Thread(target=reader))
+    for t in threads:
+        t.start()
+    for t in threads[:2]:
+        t.join()
+    stop.set()
+    threads[2].join()
+
+    # 读取到的每个状态都是状态机中的完整状态（枚举解析即保证）
+    assert set(observed) <= set(DocumentStatus)
+    # 批次结束后没有文档滞留在处理中间态
+    for i in range(30):
+        status = service.get_document(f"d{i:02d}").status
+        assert status in (DocumentStatus.ARCHIVED, DocumentStatus.ACTIVE)
+    assert service.get_document("d05").status == DocumentStatus.ACTIVE

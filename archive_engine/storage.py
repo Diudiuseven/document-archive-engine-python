@@ -97,22 +97,26 @@ def _row_to_hold(row: sqlite3.Row) -> LegalHold:
 
 
 class Storage:
-    """线程安全的 SQLite 存储。check_same_thread=False + 写锁串行化写事务。"""
+    """线程安全的 SQLite 存储。
+
+    单连接 + 可重入锁串行化所有读写：读取不会与未提交的写事务交错，
+    因此读取方永远只能看到完整的已提交状态。
+    """
 
     def __init__(self, path: str = ":memory:") -> None:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
-        self._write_lock = threading.Lock()
-        with self._write_lock:
+        self._lock = threading.RLock()
+        with self._lock:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
         """写事务：提交前读取方看不到中间态。"""
-        with self._write_lock:
+        with self._lock:
             try:
                 yield self._conn
                 self._conn.commit()
@@ -146,16 +150,18 @@ class Storage:
             )
 
     def get_document(self, document_id: str) -> Optional[Document]:
-        row = self._conn.execute(
-            "SELECT * FROM documents WHERE document_id=?", (document_id,)
-        ).fetchone()
-        return _row_to_document(row) if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM documents WHERE document_id=?", (document_id,)
+            ).fetchone()
+            return _row_to_document(row) if row else None
 
     def get_content(self, document_id: str) -> Optional[bytes]:
-        row = self._conn.execute(
-            "SELECT data FROM contents WHERE document_id=?", (document_id,)
-        ).fetchone()
-        return bytes(row["data"]) if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM contents WHERE document_id=?", (document_id,)
+            ).fetchone()
+            return bytes(row["data"]) if row else None
 
     def iter_due_documents(
         self,
@@ -167,14 +173,15 @@ class Storage:
     ) -> list[Document]:
         """按游标分页拉取到期文档，不一次性加载全部。"""
         assert due_column in ("archive_due_at", "destroy_due_at")
-        rows = self._conn.execute(
-            f"""SELECT * FROM documents
-                WHERE status=? AND {due_column} IS NOT NULL AND {due_column}<=?
-                  AND document_id>?
-                ORDER BY document_id LIMIT ?""",
-            (status.value, now.isoformat(), after_id, limit),
-        ).fetchall()
-        return [_row_to_document(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT * FROM documents
+                    WHERE status=? AND {due_column} IS NOT NULL AND {due_column}<=?
+                      AND document_id>?
+                    ORDER BY document_id LIMIT ?""",
+                (status.value, now.isoformat(), after_id, limit),
+            ).fetchall()
+            return [_row_to_document(r) for r in rows]
 
     # ---- 状态流转（事务内校验并提交） ----
     def transition(
@@ -301,15 +308,16 @@ class Storage:
             )
 
     def read_archive_blob(self, document_id: str) -> tuple[bytes, str]:
-        row = self._conn.execute(
-            "SELECT data, checksum FROM archive_blobs WHERE document_id=?",
-            (document_id,),
-        ).fetchone()
-        if row is None:
-            raise ArchiveDataMissingError(
-                f"archive blob missing for document {document_id!r}"
-            )
-        return bytes(row["data"]), row["checksum"]
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data, checksum FROM archive_blobs WHERE document_id=?",
+                (document_id,),
+            ).fetchone()
+            if row is None:
+                raise ArchiveDataMissingError(
+                    f"archive blob missing for document {document_id!r}"
+                )
+            return bytes(row["data"]), row["checksum"]
 
     def delete_content(self, document_id: str) -> None:
         with self._tx() as conn:
@@ -330,9 +338,10 @@ class Storage:
             )
 
     def get_policy(self, policy_id: str) -> Optional[RetentionPolicy]:
-        row = self._conn.execute(
-            "SELECT * FROM policies WHERE policy_id=?", (policy_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM policies WHERE policy_id=?", (policy_id,)
+            ).fetchone()
         if row is None:
             return None
         return RetentionPolicy(
@@ -345,13 +354,14 @@ class Storage:
     def iter_documents_by_policy(
         self, policy_id: str, after_id: str = "", limit: int = 100
     ) -> list[Document]:
-        rows = self._conn.execute(
-            """SELECT * FROM documents
-               WHERE policy_id=? AND document_id>?
-               ORDER BY document_id LIMIT ?""",
-            (policy_id, after_id, limit),
-        ).fetchall()
-        return [_row_to_document(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM documents
+                   WHERE policy_id=? AND document_id>?
+                   ORDER BY document_id LIMIT ?""",
+                (policy_id, after_id, limit),
+            ).fetchall()
+            return [_row_to_document(r) for r in rows]
 
     def update_document_schedule(
         self,
@@ -394,11 +404,12 @@ class Storage:
             )
 
     def active_holds(self, document_id: str) -> list[LegalHold]:
-        rows = self._conn.execute(
-            "SELECT * FROM legal_holds WHERE document_id=? AND released_at IS NULL",
-            (document_id,),
-        ).fetchall()
-        return [_row_to_hold(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM legal_holds WHERE document_id=? AND released_at IS NULL",
+                (document_id,),
+            ).fetchall()
+            return [_row_to_hold(r) for r in rows]
 
     # ---- 检查点（重启恢复） ----
     def save_checkpoint(self, task_name: str, cursor: str) -> None:
@@ -412,7 +423,8 @@ class Storage:
             )
 
     def load_checkpoint(self, task_name: str) -> Optional[str]:
-        row = self._conn.execute(
-            "SELECT cursor FROM checkpoints WHERE task_name=?", (task_name,)
-        ).fetchone()
-        return row["cursor"] if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cursor FROM checkpoints WHERE task_name=?", (task_name,)
+            ).fetchone()
+            return row["cursor"] if row else None
